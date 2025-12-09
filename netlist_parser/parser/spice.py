@@ -69,7 +69,8 @@ class SpiceParser(BaseParser):
         return self.circuit
 
     def _parse_line(self, line: str, line_num: int):
-        tokens = line.split()
+        from ..utils import tokenize_line
+        tokens = tokenize_line(line)
         if not tokens:
             return
 
@@ -90,9 +91,26 @@ class SpiceParser(BaseParser):
         elif cmd == '.INCLUDE' or cmd == '.LIB':
             # TODO: Handle includes
             self.circuit.includes.append(" ".join(tokens[1:]))
+        elif cmd == '.PARAM':
+            self._parse_param(tokens)
         else:
             # Other commands (.TRAN, .OP, etc.) - ignore for netlist parsing
             pass
+
+    def _parse_param(self, tokens: List[str]):
+        # tokens[0] is .PARAM
+        for t in tokens[1:]:
+            if '=' in t:
+                k, v = t.split('=', 1)
+                # Helper to strip parens/quotes if desired, but for AST usually keep them
+                # Just strip outer quotes if they exist? 
+                # HSPICE: w='1+1'. AST: "1+1" or "'1+1'"?
+                # Let's strip outer quotes for consistency if they are just grouping
+                if v.startswith("'") and v.endswith("'"):
+                    v = v[1:-1]
+                
+                if hasattr(self.current_scope, 'parameters'):
+                    self.current_scope.parameters[k] = v
 
     def _start_subckt(self, tokens: List[str]):
         if len(tokens) < 2:

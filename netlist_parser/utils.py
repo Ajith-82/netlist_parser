@@ -34,3 +34,15 @@ def remove_comments(line: str) -> str:
 def clean_line(line: str) -> str:
     """Strips whitespace."""
     return line.strip()
+
+def tokenize_line(line: str) -> list[str]:
+    """
+    Splits a line into tokens, respecting single quotes for HSPICE-style expressions.
+    Example: "w='1u + 2u'" -> ["w='1u + 2u'"] instead of ["w='1u", "+", "2u'"]
+    """
+    # Regex captures:
+    # 1. Sequences starting with non-space/non-quote, optionally containing quoted sections.
+    #    This handles: word, key=val, key='v a l'
+    # 2. Standalone quoted strings: 'v a l'
+    pattern = r"[^\s']+(?:'[^']*'[^\s']*)*|'[^']*'"
+    return re.findall(pattern, line)

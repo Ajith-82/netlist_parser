@@ -99,6 +99,7 @@ class Circuit(AstNode):
     subcircuits: List[Subckt] = field(default_factory=list)
     models: List[Model] = field(default_factory=list)
     includes: List[str] = field(default_factory=list)
+    parameters: Dict[str, Union[str, float, Expression]] = field(default_factory=dict)
     
     def add_component(self, component: Component):
         self.components.append(component)
