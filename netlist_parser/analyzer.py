@@ -8,6 +8,11 @@ class NetlistAnalyzer:
         self.top_cell_name = top_cell_name
         self.unresolved_subckts: set[str] = set()
 
+        if self.top_cell_name:
+            # Validate existence immediately
+            if not any(s.name == self.top_cell_name for s in self.circuit.subcircuits):
+                 raise ValueError(f"Top cell '{self.top_cell_name}' not found in netlist.")
+
     def _get_root_components(self) -> List[Component]:
         """Determines the starting components based on top_cell_name or auto-detection."""
         if self.top_cell_name:
@@ -29,6 +34,46 @@ class NetlistAnalyzer:
         
         return []
 
+    def _classify_component(self, comp: Component) -> str:
+        """
+        Classifies a component type. 
+        For SubcktInstance, attempts to classify as primitive (Mosfet, Bjt, Diode) 
+        based on heuristics (leaf cell, name, parameters).
+        """
+        if not isinstance(comp, SubcktInstance):
+            return type(comp).__name__
+            
+        # It's a SubcktInstance. Check if it's a leaf/blackbox.
+        subckt_def = next((s for s in self.circuit.subcircuits if s.name == comp.subckt_name), None)
+        
+        # If definition found and has components, it's a structural block, not a primitive.
+        if subckt_def and subckt_def.components:
+             return "SubcktInstance"
+             
+        # It's a leaf (empty subckt definition) or unresolved (treated as leaf).
+        name_lower = comp.subckt_name.lower()
+        
+        # Check heuristics
+        
+        # MOSFET: Name contains fet/mos AND has W/L params
+        if "fet" in name_lower or "mos" in name_lower:
+            # Check for W and L params (case-insensitive keys)
+            # Parameters might be in comp.parameters dict
+            # We need to handle case-insensitivity of keys
+            param_keys = {k.upper() for k in comp.parameters.keys()}
+            if "W" in param_keys and "L" in param_keys:
+                return "Mosfet"
+                
+        # BJT: Name contains bjt/npn/pnp
+        if "bjt" in name_lower or "npn" in name_lower or "pnp" in name_lower:
+            return "Bjt"
+            
+        # Diode: Name contains diode
+        if "diode" in name_lower:
+            return "Diode"
+            
+        return "SubcktInstance"
+
     def get_stats(self) -> Dict[str, int]:
         """Returns a count of all primitives in the top-level circuit (no flattening)."""
         stats = Counter()
@@ -38,8 +83,49 @@ class NetlistAnalyzer:
             return {}
 
         for comp in comps:
-            stats[type(comp).__name__] += 1
+            stats[self._classify_component(comp)] += 1
         return dict(stats)
+
+    def get_hierarchical_stats(self) -> Dict[str, int]:
+        """Returns a count of all primitives in the flattened circuit (recursive)."""
+        stats = Counter()
+        try:
+            flat_circuit = self.flatten()
+            comps = flat_circuit.components
+        except Exception:
+            # Fallback or empty if flattening fails
+            return {}
+
+        for comp in comps:
+            stats[self._classify_component(comp)] += 1
+        return dict(stats)
+
+    def print_hierarchy(self):
+        """Prints an ASCII tree of the circuit hierarchy (subcircuit instances only)."""
+        roots = self._get_root_components()
+        root_name = self.top_cell_name if self.top_cell_name else self.circuit.name
+        print(root_name)
+
+        subckt_map = {s.name: s for s in self.circuit.subcircuits}
+
+        def _print_level(components, prefix=""):
+            # Filter for SubcktInstances only to keep tree readable
+            instances = [c for c in components if isinstance(c, SubcktInstance)]
+            # Sort by name for consistent output
+            instances.sort(key=lambda x: x.name)
+
+            for i, inst in enumerate(instances):
+                is_last = (i == len(instances) - 1)
+                connector = "└── " if is_last else "├── "
+                print(f"{prefix}{connector}{inst.name} ({inst.subckt_name})")
+
+                new_prefix = prefix + ("    " if is_last else "│   ")
+                
+                if inst.subckt_name in subckt_map:
+                    _print_level(subckt_map[inst.subckt_name].components, new_prefix)
+                # Else: it's an unresolved subckt or primitive (if we were printing them), nothing to recurse
+
+        _print_level(roots)
 
     def get_top_cells(self) -> List[str]:
         """Returns a list of names of all top-level subcircuits (defined but not instantiated)."""
@@ -94,6 +180,13 @@ class NetlistAnalyzer:
                         new_comp.name = f"{path}.{comp.name}" if path else comp.name
                         flat_circuit.add_component(new_comp)
                         continue
+
+                    # NEW: Trace empty subcircuits as leaf cells (primitives)
+                    if not subckt_def.components:
+                         new_comp = copy.deepcopy(comp)
+                         new_comp.name = f"{path}.{comp.name}" if path else comp.name
+                         flat_circuit.add_component(new_comp)
+                         continue
 
                     # Map nodes
                     # Subckt ports map to Instance nodes
@@ -150,7 +243,8 @@ class NetlistAnalyzer:
         flat = self.flatten()
         count = 0
         for comp in flat.components:
-            if isinstance(comp, (Mosfet, Bjt)):
+            classification = self._classify_component(comp)
+            if classification in ("Mosfet", "Bjt"):
                  count += 1
         return count
 
@@ -163,6 +257,9 @@ class NetlistAnalyzer:
             # Check if component has a 'model' attribute
             if hasattr(comp, 'model') and comp.model:
                 model_counts[comp.model] += 1
+            elif isinstance(comp, SubcktInstance):
+                # Treat subckt name as model for black/leaf boxes
+                model_counts[comp.subckt_name] += 1
                 
         return dict(model_counts)
     

@@ -54,21 +54,30 @@ class SpiceParser(BaseParser):
         return self.parse(content, filename=filepath, circuit_name=name)
 
     def parse(self, content: str, filename: str = "<string>", circuit_name: str = "top") -> Circuit:
-        self.tokenizer = SpiceTokenizer(content)
+        import os
         self.circuit = Circuit(name=circuit_name)
-        self.current_scope = self.circuit # Can be Circuit or Subckt
+        self.current_scope = self.circuit 
         self.scope_stack = []
+        
+        # Track visited files to prevent cyclic includes
+        # Store absolute paths
+        abs_path = os.path.abspath(filename)
+        self.visited_files = {abs_path}
 
-        for line_num, line in self.tokenizer.get_logical_lines():
-            try:
-                self._parse_line(line, line_num)
-            except Exception as e:
-                # In a real tool, we might want to log warnings and continue
-                print(f"Warning: Failed to parse line {line_num}: {line}. Error: {e}")
+        self._process_content(content, filename)
         
         return self.circuit
 
-    def _parse_line(self, line: str, line_num: int):
+    def _process_content(self, content: str, file_path: str):
+        tokenizer = SpiceTokenizer(content)
+        
+        for line_num, line in tokenizer.get_logical_lines():
+            try:
+                self._parse_line(line, line_num, file_path)
+            except Exception as e:
+                print(f"Warning: Failed to parse line {line_num} in {file_path}: {line}. Error: {e}")
+
+    def _parse_line(self, line: str, line_num: int, file_path: str):
         from ..utils import tokenize_line
         tokens = tokenize_line(line)
         if not tokens:
@@ -77,11 +86,11 @@ class SpiceParser(BaseParser):
         cmd = tokens[0].upper()
 
         if cmd.startswith('.'):
-            self._parse_dot_command(cmd, tokens, line_num)
+            self._parse_dot_command(cmd, tokens, line_num, file_path)
         else:
             self._parse_component(cmd, tokens, line_num)
 
-    def _parse_dot_command(self, cmd: str, tokens: List[str], line_num: int):
+    def _parse_dot_command(self, cmd: str, tokens: List[str], line_num: int, file_path: str):
         if cmd == '.SUBCKT':
             self._start_subckt(tokens)
         elif cmd == '.ENDS':
@@ -89,13 +98,48 @@ class SpiceParser(BaseParser):
         elif cmd == '.MODEL':
             self._parse_model(tokens)
         elif cmd == '.INCLUDE' or cmd == '.LIB':
-            # TODO: Handle includes
-            self.circuit.includes.append(" ".join(tokens[1:]))
+            if len(tokens) > 1:
+                include_path = tokens[1]
+                # For .LIB, typically .lib "path" entry_name. We just include the whole file for now.
+                # Remove quotes if present
+                include_path = include_path.strip('"').strip("'")
+                self._handle_include(include_path, file_path)
         elif cmd == '.PARAM':
             self._parse_param(tokens)
         else:
             # Other commands (.TRAN, .OP, etc.) - ignore for netlist parsing
             pass
+
+    def _handle_include(self, include_path: str, current_file_path: str):
+        import os
+        
+        # Resolve path
+        if os.path.isabs(include_path):
+            target_path = include_path
+        else:
+            current_dir = os.path.dirname(os.path.abspath(current_file_path))
+            target_path = os.path.join(current_dir, include_path)
+            
+        target_path = os.path.abspath(target_path)
+        
+        if target_path in self.visited_files:
+            return # Cycle or duplicate include detected
+            
+        if not os.path.exists(target_path):
+             print(f"Warning: Include file not found: {target_path}")
+             return
+
+        self.visited_files.add(target_path)
+        
+        try:
+            with open(target_path, 'r') as f:
+                content = f.read()
+            # Recursively process
+            self._process_content(content, target_path)
+            # Add to list for record keeping
+            self.circuit.includes.append(target_path)
+        except Exception as e:
+            print(f"Warning: Failed to read include file {target_path}: {e}")
 
     def _parse_param(self, tokens: List[str]):
         # tokens[0] is .PARAM

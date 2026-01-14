@@ -12,6 +12,7 @@ def main():
     parser.add_argument("--count-transistors", action="store_true", help="Count total transistors (MOS+BJT) in flattened circuit")
     parser.add_argument("--model-usage", action="store_true", help="Count usage of each device model in flattened circuit")
     parser.add_argument("--find-model", help="Find all subcircuits that use the specified model name", metavar="MODEL_NAME")
+    parser.add_argument("--tree", action="store_true", help="Print hierarchy tree (subcircuit instances only)")
     parser.add_argument("--list-top-cells", action="store_true", help="List all potential top-level subcircuits (not instantiated by others)")
     parser.add_argument("--top-cell", help="Manually specify the name of the top-level subcircuit to analyze", metavar="TOP_CELL_NAME")
 
@@ -43,6 +44,11 @@ def main():
         for comp, count in stats.items():
             print(f"{comp}: {count}")
 
+        print("\n--- Component Statistics (Hierarchical/Flattened) ---")
+        h_stats = analyzer.get_hierarchical_stats()
+        for comp, count in h_stats.items():
+            print(f"{comp}: {count}")
+
     if args.count_transistors:
         count = analyzer.get_transistor_count()
         print(f"\nTotal Transistors (Flattend): {count}")
@@ -50,8 +56,8 @@ def main():
     if args.model_usage:
         print("\n--- Model Usage (Flattened) ---")
         usage = analyzer.get_model_usage()
-        for model, count in usage.items():
-            print(f"{model}: {count}")
+        for model in sorted(usage.keys()):
+            print(f"{model}: {usage[model]}")
             
         if analyzer.unresolved_subckts:
             print("\n[WARNING] The following subcircuits were instantiated but not defined (treated as black boxes):")
@@ -67,6 +73,10 @@ def main():
                 print(s)
         else:
              print("No subcircuits found using this model.")
+
+    if args.tree:
+        print("\n--- Circuit Hierarchy ---")
+        analyzer.print_hierarchy()
 
     if args.list_top_cells:
         print("\n--- Top Cells (Roots of Hierarchy) ---")
