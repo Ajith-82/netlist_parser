@@ -1,11 +1,19 @@
 import re
-from typing import List, Optional, Tuple, Iterator
+import logging
+import os
+from typing import List, Optional, Tuple, Iterator, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from .base import BaseParser, Token, ParseError
 from ..ast import (
     Circuit, Subckt, Resistor, Capacitor, Inductor, Mosfet, Bjt, Diode,
     VoltageSource, CurrentSource, SubcktInstance, Model, Component, Parameter
 )
 from ..utils import remove_comments, clean_line
+
+logger = logging.getLogger(__name__)
+
+# Default number of worker threads for I/O operations
+DEFAULT_IO_WORKERS = min(8, (os.cpu_count() or 4))
 
 class SpiceTokenizer:
     """Handles SPICE line continuation and tokenization."""
@@ -46,26 +54,39 @@ class SpiceTokenizer:
             yield start_line, buffer
 
 class SpiceParser(BaseParser):
+    def __init__(self, num_threads: int = DEFAULT_IO_WORKERS):
+        """Initialize parser with optional thread count for I/O operations."""
+        self.num_threads = num_threads
+        self._file_cache: Dict[str, str] = {}  # Cache for pre-loaded files
+
     def parse_file(self, filepath: str) -> Circuit:
-        import os
         name = os.path.splitext(os.path.basename(filepath))[0]
         with open(filepath, 'r') as f:
             content = f.read()
         return self.parse(content, filename=filepath, circuit_name=name)
 
     def parse(self, content: str, filename: str = "<string>", circuit_name: str = "top") -> Circuit:
-        import os
         self.circuit = Circuit(name=circuit_name)
-        self.current_scope = self.circuit 
+        self.current_scope = self.circuit
         self.scope_stack = []
-        
+        self._file_cache = {}  # Reset cache for new parse
+
         # Track visited files to prevent cyclic includes
         # Store absolute paths
         abs_path = os.path.abspath(filename)
         self.visited_files = {abs_path}
 
+        logger.info(f"Starting parse of '{filename}'")
+
+        # Pre-load include files in parallel for faster I/O
+        if self.num_threads > 1:
+            self._preload_includes(content, filename)
         self._process_content(content, filename)
-        
+
+        logger.info(f"Parse complete: {len(self.circuit.subcircuits)} subcircuits, "
+                   f"{len(self.circuit.components)} top-level components, "
+                   f"{len(self.circuit.models)} models")
+
         return self.circuit
 
     def _process_content(self, content: str, file_path: str):
@@ -110,36 +131,136 @@ class SpiceParser(BaseParser):
             # Other commands (.TRAN, .OP, etc.) - ignore for netlist parsing
             pass
 
-    def _handle_include(self, include_path: str, current_file_path: str):
-        import os
-        
-        # Resolve path
+    def _resolve_include_path(self, include_path: str, current_file_path: str) -> str:
+        """Resolve include path to absolute path."""
         if os.path.isabs(include_path):
-            target_path = include_path
+            return os.path.abspath(include_path)
+        current_dir = os.path.dirname(os.path.abspath(current_file_path))
+        return os.path.abspath(os.path.join(current_dir, include_path))
+
+    def _read_file(self, filepath: str) -> Optional[str]:
+        """Read a file and return its contents, or None on error."""
+        try:
+            with open(filepath, 'r') as f:
+                return f.read()
+        except Exception as e:
+            logger.warning(f"Failed to read file {filepath}: {e}")
+            return None
+
+    def _is_numeric_value(self, token: str) -> bool:
+        """
+        Check if a token looks like a numeric value (vs a model name).
+        Numeric values: 1k, 10meg, 1.5u, 100, +5, -3.2e-6, etc.
+        Model names: opppcres, nmos, pmos, etc.
+        """
+        if not token:
+            return False
+        # Remove leading +/- sign
+        s = token.lstrip('+-')
+        if not s:
+            return False
+        # Check if it starts with a digit or decimal point
+        if s[0].isdigit() or s[0] == '.':
+            return True
+        return False
+
+    def _is_parameter(self, token: str) -> bool:
+        """Check if a token is a parameter (contains '=')."""
+        return '=' in token
+
+    def _parse_rcl_element(self, tokens, elem_type):
+        """
+        Parse R/C/L element handling 2 or 3 terminal devices.
+
+        Formats supported:
+        - N1 N2 value                 - 2 nodes + numeric value
+        - N1 N2 model [params]        - 2 nodes + model name
+        - N1 N2 N3 model [params]     - 3 nodes (with substrate) + model
+
+        Returns: (nodes, value, model_name, val_idx)
+        """
+        # Default: assume 2 nodes
+        token3 = tokens[3] if len(tokens) > 3 else "0"
+        token4 = tokens[4] if len(tokens) > 4 else None
+
+        if self._is_numeric_value(token3):
+            # Classic: R N1 N2 value
+            return tokens[1:3], token3, None, 4
+
+        # token3 is not numeric - could be model or third node
+        if token4 and not self._is_parameter(token4):
+            # token4 exists and is not a param -> 3 nodes, token4 is model
+            return tokens[1:4], "0", token4, 5
         else:
-            current_dir = os.path.dirname(os.path.abspath(current_file_path))
-            target_path = os.path.join(current_dir, include_path)
-            
-        target_path = os.path.abspath(target_path)
-        
+            # 2 nodes, token3 is model
+            return tokens[1:3], "0", token3, 4
+
+    def _preload_includes(self, content: str, base_path: str):
+        """
+        Pre-scan content for include directives and load files in parallel.
+        This speeds up I/O for netlists with many include files.
+        """
+        include_pattern = re.compile(
+            r'^\s*\.(INCLUDE|LIB)\s+["\']?([^"\']+)["\']?',
+            re.IGNORECASE | re.MULTILINE
+        )
+
+        # Find all includes in the content
+        paths_to_load = []
+        for match in include_pattern.finditer(content):
+            inc_path = match.group(2).strip()
+            resolved = self._resolve_include_path(inc_path, base_path)
+            if resolved not in self._file_cache and os.path.exists(resolved):
+                paths_to_load.append(resolved)
+
+        if not paths_to_load:
+            return
+
+        logger.info(f"Pre-loading {len(paths_to_load)} include files "
+                   f"using {self.num_threads} threads...")
+
+        def load_file(path: str) -> tuple:
+            content = self._read_file(path)
+            return (path, content)
+
+        # Parallel file reading
+        with ThreadPoolExecutor(max_workers=self.num_threads) as executor:
+            futures = {executor.submit(load_file, p): p for p in paths_to_load}
+            for future in as_completed(futures):
+                path, file_content = future.result()
+                if file_content is not None:
+                    self._file_cache[path] = file_content
+                    # Recursively pre-load includes from this file
+                    self._preload_includes(file_content, path)
+
+    def _handle_include(self, include_path: str, current_file_path: str):
+        # Resolve path
+        target_path = self._resolve_include_path(include_path, current_file_path)
+
         if target_path in self.visited_files:
-            return # Cycle or duplicate include detected
-            
+            logger.debug(f"Skipping already visited include: {target_path}")
+            return  # Cycle or duplicate include detected
+
         if not os.path.exists(target_path):
-             print(f"Warning: Include file not found: {target_path}")
-             return
+            logger.warning(f"Include file not found: {target_path}")
+            self.circuit.failed_includes.append(target_path)
+            return
 
         self.visited_files.add(target_path)
-        
-        try:
-            with open(target_path, 'r') as f:
-                content = f.read()
-            # Recursively process
-            self._process_content(content, target_path)
-            # Add to list for record keeping
-            self.circuit.includes.append(target_path)
-        except Exception as e:
-            print(f"Warning: Failed to read include file {target_path}: {e}")
+        logger.info(f"Processing include: {target_path}")
+
+        # Check cache first (populated by _preload_includes)
+        if target_path in self._file_cache:
+            content = self._file_cache[target_path]
+        else:
+            content = self._read_file(target_path)
+
+        if content is None:
+            return
+
+        # Process the content
+        self._process_content(content, target_path)
+        self.circuit.includes.append(target_path)
 
     def _parse_param(self, tokens: List[str]):
         # tokens[0] is .PARAM
@@ -175,7 +296,8 @@ class SpiceParser(BaseParser):
 
         subckt = Subckt(name=name, ports=cleaned_ports, parameters=params)
         self.circuit.add_subckt(subckt)
-        
+        logger.debug(f"Found subcircuit: {name} with {len(cleaned_ports)} ports")
+
         # Push current scope
         self.scope_stack.append(self.current_scope)
         self.current_scope = subckt
@@ -220,25 +342,22 @@ class SpiceParser(BaseParser):
         # Common pattern: Name Node1 Node2 ... [Value/Model] [Params]
         
         if first_char == 'R':
-            # Rname N1 N2 Value
-            nodes = tokens[1:3]
-            value = tokens[3] if len(tokens) > 3 else "0"
-            comp = Resistor(name=name, nodes=nodes, value=value)
-            val_idx = 4
-            
+            # Resistor formats:
+            # R N1 N2 value                    - 2 nodes + numeric value
+            # R N1 N2 model [params]           - 2 nodes + model name
+            # R N1 N2 N3 model [params]        - 3 nodes (with substrate) + model name
+            nodes, value, model_name, val_idx = self._parse_rcl_element(tokens, 'R')
+            comp = Resistor(name=name, nodes=nodes, value=value, model=model_name)
+
         elif first_char == 'C':
-             # Cname N1 N2 Value
-            nodes = tokens[1:3]
-            value = tokens[3] if len(tokens) > 3 else "0"
-            comp = Capacitor(name=name, nodes=nodes, value=value)
-            val_idx = 4
+            # Capacitor formats (same as resistor)
+            nodes, value, model_name, val_idx = self._parse_rcl_element(tokens, 'C')
+            comp = Capacitor(name=name, nodes=nodes, value=value, model=model_name)
 
         elif first_char == 'L':
-             # Lname N1 N2 Value
-            nodes = tokens[1:3]
-            value = tokens[3] if len(tokens) > 3 else "0"
-            comp = Inductor(name=name, nodes=nodes, value=value)
-            val_idx = 4
+            # Inductor formats (same as resistor)
+            nodes, value, model_name, val_idx = self._parse_rcl_element(tokens, 'L')
+            comp = Inductor(name=name, nodes=nodes, value=value, model=model_name)
             
         elif first_char == 'M':
             # Mname D G S B Model [L=... W=...]
