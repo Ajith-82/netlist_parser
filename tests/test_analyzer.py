@@ -77,6 +77,25 @@ class TestAnalyzer(unittest.TestCase):
         # So Xtop.X1.R1 nodes should be ['in', 'Xtop.mid']
         self.assertEqual(comp1.nodes, ['in', 'Xtop.mid'])
 
+    def test_get_all_models_includes_leaf_instances(self):
+        # CDL style: MOSFETs as X-instances of undefined (PDK) leaf cells
+        netlist = """
+        .subckt inv in out vdd vss
+        XM1 out in vss vss nmos_1p5 W=1u L=0.2u
+        XM2 out in vdd vdd pmos_1p5 W=2u L=0.2u
+        D1 vss out np_dw AREA=1e-12
+        .ends
+
+        X1 a b p g inv
+        """
+        circuit = self.parser.parse(netlist)
+        analyzer = NetlistAnalyzer(circuit)
+        models = analyzer.get_all_models()
+
+        self.assertEqual(models, ["nmos_1p5", "np_dw", "pmos_1p5"])
+        # Structural subckts with definitions must not be listed as models
+        self.assertNotIn("inv", models)
+
     def test_model_usage(self):
         netlist = """
         .model nmos_vtg nmos

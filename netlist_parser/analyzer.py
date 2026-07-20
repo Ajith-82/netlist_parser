@@ -355,11 +355,20 @@ class NetlistAnalyzer:
             Sorted list of unique model names found in the netlist.
         """
         models = set()
+        subckt_map = {s.name: s for s in self.circuit.subcircuits}
 
         def extract_model(comp):
             """Extract model name from a component if it has one."""
             if hasattr(comp, 'model') and comp.model:
                 return comp.model.lower() if case_insensitive else comp.model
+            if isinstance(comp, SubcktInstance):
+                # CDL primitives are often X-instances of leaf cells
+                # (e.g. "XM1 d g s b pmos_1p5 W=... L=..."). Treat instances
+                # of empty or undefined subcircuits as devices.
+                sub_def = subckt_map.get(comp.subckt_name)
+                if sub_def is None or not sub_def.components:
+                    return (comp.subckt_name.lower() if case_insensitive
+                            else comp.subckt_name)
             return None
 
         # Scan all subcircuit definitions
