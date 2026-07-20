@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "netlist-parser"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Python utility for parsing, analyzing, and manipulating SPICE netlists with support for CDL and hierarchical analysis"
 authors = ["Ajith Venugopalan"]
 license = "MIT"

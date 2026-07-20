@@ -150,10 +150,10 @@ poetry build
 
 # 2. On the cluster: install into a versioned venv on the shared tools area
 #    (module load python/3.11 first if the system python3 is older than 3.9)
-./deploy/install.sh dist/netlist_parser-0.1.0-py3-none-any.whl /apps/tools/netlist-parser
+./deploy/install.sh dist/netlist_parser-0.2.0-py3-none-any.whl /apps/tools/netlist-parser
 
 # 3. Install the Lmod modulefile (edit the `root` path inside first)
-cp deploy/modulefile.lua <modules-root>/netlist-parser/0.1.0.lua
+cp deploy/modulefile.lua <modules-root>/netlist-parser/0.2.0.lua
 ```
 
 Users then get the CLI with `module load netlist-parser`.
