@@ -15,24 +15,26 @@ class NetlistAnalyzer:
         self.circuit = circuit
         self.top_cell_name = top_cell_name
         self.unresolved_subckts: set[str] = set()
+        # Name -> definition lookup; avoids O(n) scans per instance
+        self._subckt_map: Dict[str, Subckt] = {s.name: s for s in circuit.subcircuits}
 
         logger.info(f"Initializing analyzer for circuit: {circuit.name}")
         if self.top_cell_name:
             logger.info(f"Using specified top cell: {self.top_cell_name}")
             # Validate existence immediately
-            if not any(s.name == self.top_cell_name for s in self.circuit.subcircuits):
+            if self.top_cell_name not in self._subckt_map:
                  raise ValueError(f"Top cell '{self.top_cell_name}' not found in netlist.")
 
     def _get_root_components(self) -> List[Component]:
         """Determines the starting components based on top_cell_name or auto-detection."""
         if self.top_cell_name:
             # User specified top cell
-            subckt = next((s for s in self.circuit.subcircuits if s.name == self.top_cell_name), None)
+            subckt = self._subckt_map.get(self.top_cell_name)
             if not subckt:
                 raise ValueError(f"Top cell '{self.top_cell_name}' not found in netlist.")
             logger.debug(f"Using user-specified top cell: {self.top_cell_name} "
                         f"({len(subckt.components)} direct components)")
-            return copy.deepcopy(subckt.components)
+            return subckt.components
 
         if self.circuit.components:
             logger.debug(f"Using top-level components ({len(self.circuit.components)} components)")
@@ -43,7 +45,7 @@ class NetlistAnalyzer:
         if top_subckt:
             logger.debug(f"Using auto-detected top cell: {top_subckt.name} "
                         f"({len(top_subckt.components)} direct components)")
-            return copy.deepcopy(top_subckt.components)
+            return top_subckt.components
 
         logger.warning("No top cell found - returning empty component list")
         return []
@@ -58,7 +60,7 @@ class NetlistAnalyzer:
             return type(comp).__name__
             
         # It's a SubcktInstance. Check if it's a leaf/blackbox.
-        subckt_def = next((s for s in self.circuit.subcircuits if s.name == comp.subckt_name), None)
+        subckt_def = self._subckt_map.get(comp.subckt_name)
         
         # If definition found and has components, it's a structural block, not a primitive.
         if subckt_def and subckt_def.components:
@@ -120,7 +122,7 @@ class NetlistAnalyzer:
         root_name = self.top_cell_name if self.top_cell_name else self.circuit.name
         print(root_name)
 
-        subckt_map = {s.name: s for s in self.circuit.subcircuits}
+        subckt_map = self._subckt_map
 
         def _print_level(components, prefix=""):
             # Filter for SubcktInstances only to keep tree readable
@@ -171,7 +173,7 @@ class NetlistAnalyzer:
         logger.warning(f"Multiple top cells found ({len(roots)}). "
                       f"Use --top-cell to specify. Attempting auto-detection...")
 
-        subckt_map = {s.name: s for s in self.circuit.subcircuits}
+        subckt_map = self._subckt_map
 
         def count_components(subckt_name: str, visited: set) -> int:
             """Recursively count components in a subcircuit hierarchy."""
@@ -227,69 +229,53 @@ class NetlistAnalyzer:
         """
         logger.info("Starting circuit flattening...")
         flat_circuit = Circuit(name=self.circuit.name + "_flat")
-        flat_circuit.models = copy.deepcopy(self.circuit.models)
-        
-        # Helper to recursively flatten
-        def _flatten_instance(components: List[Component], path: str):
+        flat_circuit.models = list(self.circuit.models)
+        subckt_map = self._subckt_map
+
+        def _resolve_node(n: str, path: str, node_map: Dict[str, str]) -> str:
+            """Map a subckt-local net name to its flattened name."""
+            if n in node_map:
+                return node_map[n]  # Connected to parent net via port
+            if not path:
+                return n  # Top-level net, keep as is
+            if n == "0" or n.upper() == "GND":
+                return "0"  # Global GND
+            return f"{path}.{n}"  # Internal net, scope by instance path
+
+        # Recursively flatten. node_map maps the current subckt's port names
+        # to already-resolved parent net names, so nodes are rewritten once
+        # per emitted component instead of deep-copying whole subtrees.
+        def _flatten_instance(components: List[Component], path: str,
+                              node_map: Dict[str, str]):
             for comp in components:
                 if isinstance(comp, SubcktInstance):
-                    # Find the subckt definition
-                    subckt_def = next((s for s in self.circuit.subcircuits if s.name == comp.subckt_name), None)
+                    subckt_def = subckt_map.get(comp.subckt_name)
+                    if subckt_def and subckt_def.components:
+                        # Structural block: recurse with a fresh port map
+                        if len(subckt_def.ports) != len(comp.nodes):
+                            logger.debug(f"Port count mismatch for {comp.name} "
+                                        f"({comp.subckt_name})")
+                        instance_path = f"{path}.{comp.name}" if path else comp.name
+                        child_map = {
+                            port: _resolve_node(node, path, node_map)
+                            for port, node in zip(subckt_def.ports, comp.nodes)
+                        }
+                        _flatten_instance(subckt_def.components, instance_path,
+                                          child_map)
+                        continue
                     if not subckt_def:
-                        # Warning: Subckt not found, treating as a black box
+                        # Not found: treat as black box
                         self.unresolved_subckts.add(comp.subckt_name)
                         logger.debug(f"Unresolved subcircuit: {comp.subckt_name}")
-                        # Copy as is or raise error? For now, keep as instance
-                        new_comp = copy.deepcopy(comp)
-                        new_comp.name = f"{path}.{comp.name}" if path else comp.name
-                        flat_circuit.add_component(new_comp)
-                        continue
+                    # Unresolved or empty definition: emit as leaf below
 
-                    # NEW: Trace empty subcircuits as leaf cells (primitives)
-                    if not subckt_def.components:
-                         new_comp = copy.deepcopy(comp)
-                         new_comp.name = f"{path}.{comp.name}" if path else comp.name
-                         flat_circuit.add_component(new_comp)
-                         continue
-
-                    # Map nodes
-                    # Subckt ports map to Instance nodes
-                    if len(subckt_def.ports) != len(comp.nodes):
-                        # Warning: Port mismatch
-                        pass
-                    
-                    node_map = {}
-                    for port, node in zip(subckt_def.ports, comp.nodes):
-                        node_map[port] = node # Map internal port name to external node name
-                    
-                    # Recursively flatten the subckt's components
-                    # We need to map internal nodes to scoped names, UNLESS they hit a port
-                    
-                    instance_path = f"{path}.{comp.name}" if path else comp.name
-                    
-                    # Pre-process components for node renaming
-                    # Create a deep copy of subckt components to modify
-                    sub_components = copy.deepcopy(subckt_def.components)
-                    
-                    for sub_comp in sub_components:
-                         new_nodes = []
-                         for n in sub_comp.nodes:
-                             if n in node_map:
-                                 new_nodes.append(node_map[n]) # Connected to parent net
-                             elif n == "0" or n.upper() == "GND":
-                                 new_nodes.append("0") # Global GND
-                             else:
-                                 new_nodes.append(f"{instance_path}.{n}") # Internal net
-                         sub_comp.nodes = new_nodes
-                    
-                    # Now recurse
-                    _flatten_instance(sub_components, instance_path)
-
-                else:
-                    # Primitive component
-                    new_comp = copy.deepcopy(comp)
-                    new_comp.name = f"{path}.{comp.name}" if path else comp.name
-                    flat_circuit.add_component(new_comp)
+                # Primitive or leaf cell: emit a shallow copy with
+                # flattened name and resolved nodes
+                new_comp = copy.copy(comp)
+                new_comp.name = f"{path}.{comp.name}" if path else comp.name
+                new_comp.nodes = [_resolve_node(n, path, node_map)
+                                  for n in comp.nodes]
+                flat_circuit.add_component(new_comp)
 
         try:
              start_components = self._get_root_components()
@@ -298,7 +284,7 @@ class NetlistAnalyzer:
              # For now let's raise so main() can handle it
              raise e
 
-        _flatten_instance(start_components, "")
+        _flatten_instance(start_components, "", {})
 
         logger.info(f"Flattening complete: {len(flat_circuit.components)} components")
         if self.unresolved_subckts:
