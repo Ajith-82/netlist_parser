@@ -136,6 +136,55 @@ python3 main.py examples/complex_soc.cdl --list-top-cells
 -   **Include Files**: Processes `.INCLUDE` and `.LIB` directives with parallel file loading.
 -   **Missing Definitions**: If a subcircuit is instantiated but not defined, it is treated as a black box and reported as a warning.
 
+## Deployment on HPC Clusters (Slurm)
+
+The tool is pure Python 3.9+ with no runtime dependencies, so cluster
+deployment needs no internet access on the nodes. Ready-made scripts live in
+[`deploy/`](deploy/).
+
+### One-time installation
+
+```bash
+# 1. On any machine: build the wheel (pure-Python, works on any node)
+poetry build
+
+# 2. On the cluster: install into a versioned venv on the shared tools area
+#    (module load python/3.11 first if the system python3 is older than 3.9)
+./deploy/install.sh dist/netlist_parser-0.1.0-py3-none-any.whl /apps/tools/netlist-parser
+
+# 3. Install the Lmod modulefile (edit the `root` path inside first)
+cp deploy/modulefile.lua <modules-root>/netlist-parser/0.1.0.lua
+```
+
+Users then get the CLI with `module load netlist-parser`.
+
+### Batch processing with job arrays
+
+Parsing is single-node and mostly single-core (`-j` only parallelizes include
+file I/O), so parallelism across many netlists comes from Slurm job arrays:
+
+```bash
+# Parse every netlist under a directory, one array task per file
+./deploy/submit_parse.sh /projects/chipA/cdl results/ --model-usage
+
+# Bundle 10 small netlists per task, at most 20 tasks running at once
+FILES_PER_TASK=10 MAX_CONCURRENT=20 ./deploy/submit_parse.sh cdl/ out/ --list-models
+```
+
+`submit_parse.sh` builds a manifest of `*.cdl/*.sp/*.spi/*.spice/*.cir` files,
+sizes the array, and submits `parse_netlists.sbatch`. Each netlist's output
+lands in `<out-dir>/<name>.txt` (stderr in `<name>.err`).
+
+Notes:
+
+-   Add `--partition=`/`--account=` to the `#SBATCH` headers if your site
+    requires them; defaults are 2 CPUs, 8 GB, 1 hour per task.
+-   `MAX_CONCURRENT` throttles the array — tune it down if the netlists live
+    on a heavily shared filesystem.
+-   No scheduler? The single-file alternative is a zipapp:
+    `python3 -m zipapp netlist_parser -m "netlist_parser.cli:main" -o netlist-parser.pyz -p "/usr/bin/env python3"`
+    produces one file runnable anywhere Python 3.9+ exists.
+
 ## Library Usage
 
 ```python
