@@ -12,8 +12,10 @@ A Python-based utility for parsing, analyzing, and manipulating SPICE netlists. 
 -   **Model Extraction**: List all unique models or count their occurrences in the flattened design.
 -   **Search Capabilities**: Find which subcircuits use a specific model.
 -   **Multi-threading**: Parallel I/O for faster parsing of large netlists with many include files.
--   **Case-insensitive Matching**: SPICE-compliant case-insensitive model name handling.
+-   **Case-insensitive Matching**: SPICE-compliant case-insensitive model name handling (device names keep their source case).
 -   **3-Terminal Passives**: Supports resistors and capacitors with substrate connections.
+-   **CDL Comment-Coded Parameters**: Parses `$SUB=`, `$[model]`, and `$KEY=value` tokens instead of discarding them as comments.
+-   **Scales to Large Netlists**: Dict-based subcircuit lookup and copy-light flattening handle multi-million-line netlists in seconds.
 -   **Robustness**: Handles missing includes (reporting them as unresolved warnings) and various comment styles.
 
 ## Installation
@@ -64,7 +66,7 @@ python3 main.py [file] [options]
 | `--flatten` | Flatten the hierarchy and print the simplified list of components. |
 | `--count-transistors` | Count the total number of transistors (MOSFET + BJT) in the flattened circuit. |
 | `--model-usage` | Count usage of each device model in the flattened circuit. |
-| `--list-models` | List all unique models in the netlist (fast, no flattening required). |
+| `--list-models` | List all unique device models in the netlist, hierarchy-wide (fast, no flattening required). Includes CDL-style X-instance leaf devices. |
 | `--find-model <NAME>` | Find and list all subcircuits that directly instantiate the specified model. |
 | `--list-top-cells` | List all potential top-level subcircuits (defined but not instantiated by others). |
 | `--top-cell <NAME>` | Manually specify the name of the top-level subcircuit to analyze. |
@@ -124,9 +126,13 @@ python3 main.py examples/complex_soc.cdl --list-top-cells
 -   **HSPICE Support**: Parses `.PARAM`, quoted expressions, and multiplier parameters.
 -   **3-Terminal Passives**: Supports R/C/L with substrate connections (e.g., `R1 N1 N2 SUB model`).
 -   **Model-based Passives**: Detects resistor/capacitor models (e.g., `R1 N1 N2 opppcres l=2u w=2u`).
--   **Comments**:
+-   **Comments and CDL Comment-Coded Parameters**:
     -   `*` at the start of a line is a comment.
-    -   `$` is treated as an inline comment (everything after is ignored).
+    -   A bare `$` followed by whitespace starts an inline comment.
+    -   CDL comment-coded parameters are parsed, not discarded: `$[model]`
+        sets the device model (e.g. `RR1 N1 N2 $SUB=VSS $[opppcres] w=1u`),
+        and `$KEY=value` (e.g. `$SUB=VSS`, `$W=1u`) becomes a parameter.
+        Any other `$token` is treated as the start of a comment.
 -   **Include Files**: Processes `.INCLUDE` and `.LIB` directives with parallel file loading.
 -   **Missing Definitions**: If a subcircuit is instantiated but not defined, it is treated as a black box and reported as a warning.
 

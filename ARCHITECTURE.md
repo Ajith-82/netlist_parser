@@ -28,7 +28,7 @@ The parsing logic is separated into tokenization and semantic parsing.
     *   Handles line continuations (`+`).
     *   Strips comments:
         *   Standard SPICE: `*` at the start of a line.
-        *   Inline comments: `$ ...` (CDL style), checking ensures valid parameters before `$` are kept.
+        *   Inline comments: a bare `$` followed by whitespace (CDL style). Attached tokens like `$SUB=VSS` or `$[model]` are *not* comments and survive tokenization.
     *   Yields "logical lines" for the parser to process.
 
 *   **`SpiceParser`**:
@@ -37,6 +37,8 @@ The parsing logic is separated into tokenization and semantic parsing.
     *   **Dialect Handling**:
         *   **Standard SPICE**: `Xname node1 ... subckt_name`
         *   **CDL**: `Xname node1 ... / subckt_name params...`. The parser specifically detects the `/` token to correctly identify the subcircuit name in CDL netlists.
+        *   **CDL Comment-Coded Parameters** (`_extract_cdl_tokens`): before element parsing, `$`-prefixed tokens are separated out: `$[name]` supplies the device model (common for resistors, e.g. `RR1 N1 N2 $SUB=VSS $[opppcres] w=1u`), `$KEY=value` becomes a parameter, and any other `$token` starts an inline comment (rest of line dropped).
+    *   **Case Handling**: element-type dispatch is case-insensitive, but component names retain their source case (`Xtop` stays `Xtop`).
 
 ### 2.2 Abstract Syntax Tree (`netlist_parser/ast.py`)
 
@@ -52,15 +54,17 @@ The AST is a hierarchy of Python dataclasses representing the circuit structure.
 
 The analyzer performs heavy lifting on the AST.
 
-*   **`NetlistAnalyzer`**: The main interface for analysis.
+*   **`NetlistAnalyzer`**: The main interface for analysis. Builds a `name -> Subckt` dictionary once at construction; all definition lookups (flattening, classification, top-cell search) are O(1) instead of scanning the subcircuit list.
 *   **Top Cell Detection**:
     *   **Manual**: User supplies `--top-cell`.
     *   **Auto-detect (`find_top_cell`)**: Heuristic that looks for subcircuits that are *defined* but never *instantiated* by any other subcircuit.
 *   **Flattening Engine (`flatten`)**:
-    *   Recursively traverses `SubcktInstance` nodes.
+    *   Recursively traverses `SubcktInstance` nodes, threading a per-level port map (subckt port -> resolved parent net) through the recursion.
     *   **Node Renaming**: Generates unique hierarchical names (e.g., `X1.X2.M1`) to resolve scope.
-    *   **Node Mapping**: Maps internal subcircuit ports to parent nets.
+    *   **Node Mapping**: Maps internal subcircuit ports to parent nets via the port map; internal nets are prefixed with the instance path.
+    *   **Copy Discipline**: Emits exactly one shallow copy per flattened primitive (with new `name` and `nodes`); subcircuit definitions are never copied or mutated. Flattened components share their `parameters` dict with the source AST, so analyses must treat them as read-only.
     *   **Unresolved Handling**: If a subcircuit definition (e.g., standard cell) is missing (missing `.INCLUDE`), the analyzer tracks it in `unresolved_subckts` and treats the instance as a black box to prevent crashes.
+*   **Model Extraction (`get_all_models`)**: Scans all subcircuit definitions and top-level components without flattening. Besides modeled primitives (M/Q/D/R/C/L), instances of *empty or undefined* subcircuits are counted as devices — CDL netlists commonly instantiate PDK primitives as X-elements of leaf cells (e.g. `XM1 d g s b pmos_1p5 W=1u L=0.2u`).
 
 ## 3. Key Data Flows
 
@@ -87,3 +91,4 @@ Flattening is essential for accurate transistor counts in hierarchical designs.
 *   **Custom Parser vs. Library**: A custom parser was chosen to support CDL-specific features (like `/` separators and `$` comments) that strict SPICE parsers often fail on.
 *   **Static Analysis Focus**: The tool does not evaluate parameters (e.g., `W=1u+2u`) mathematically. It treats them as strings. This simplifies the architecture for the goal of connectivity and count analysis without needing a full SPICE simulation engine.
 *   **Error Tolerance**: The decision to warn (and continue) on missing subcircuits rather than crash allows the tool to be useful on partial netlists or when standard cell libraries are not available.
+*   **Performance**: Flattening avoids deep copies and linear definition lookups (dict lookup + one shallow copy per emitted component). A 75MB / 1.17M-line CDL netlist with ~10k subcircuits parses in ~10s and flattens in ~4s. The trade-off is that flattened components share parameter dicts with the AST and must not be mutated in place.
