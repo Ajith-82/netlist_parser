@@ -54,6 +54,30 @@ class TestSpiceParser(unittest.TestCase):
         self.assertEqual(x1.subckt_name, "inv")
         self.assertEqual(x1.nodes, ["a", "b", "vdd", "0"])
 
+    def test_cdl_comment_coded_params(self):
+        # CDL style: $SUB= substrate, $[model] device model, params continue
+        # on the next line. None of these may be mistaken for a model name.
+        netlist = """
+        RR1 N075 VDD $SUB=VSS $[opppcres] m=1 w=5E-07 s=5 pbar=1
+        + bp=3
+        """
+        circuit = self.parser.parse(netlist)
+        r1 = circuit.components[0]
+        self.assertIsInstance(r1, Resistor)
+        self.assertEqual(r1.nodes, ["N075", "VDD"])
+        self.assertEqual(r1.model, "opppcres")
+        self.assertEqual(r1.parameters["SUB"], "VSS")
+        self.assertEqual(r1.parameters["bp"], "3")
+        self.assertEqual(r1.parameters["pbar"], "1")
+
+    def test_dollar_comment_stripped(self):
+        # A bare '$ ' still starts an inline comment
+        netlist = "R1 1 0 1k $ this is a comment r=99\n"
+        circuit = self.parser.parse(netlist)
+        r1 = circuit.components[0]
+        self.assertEqual(r1.value, "1k")
+        self.assertNotIn("r", r1.parameters)
+
     def test_continuation_line(self):
         netlist = """
         M1 d g s b nmos 

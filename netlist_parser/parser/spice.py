@@ -109,7 +109,7 @@ class SpiceParser(BaseParser):
         if cmd.startswith('.'):
             self._parse_dot_command(cmd, tokens, line_num, file_path)
         else:
-            self._parse_component(cmd, tokens, line_num)
+            self._parse_component(tokens[0], tokens, line_num)
 
     def _parse_dot_command(self, cmd: str, tokens: List[str], line_num: int, file_path: str):
         if cmd == '.SUBCKT':
@@ -168,6 +168,33 @@ class SpiceParser(BaseParser):
         """Check if a token is a parameter (contains '=')."""
         return '=' in token
 
+    def _extract_cdl_tokens(self, tokens: List[str]) -> Tuple[List[str], Dict[str, str], Optional[str]]:
+        """
+        Separate CDL comment-coded parameters ($-prefixed tokens) from a
+        component line.
+
+        - $[model]   -> device model name (e.g. '$[opppcres]')
+        - $KEY=value -> parameter (e.g. '$SUB=VSS', '$W=1u')
+        - $anything  -> start of an inline comment; rest of line is dropped
+
+        Returns: (clean_tokens, cdl_params, cdl_model)
+        """
+        clean = []
+        params = {}
+        model = None
+        for t in tokens:
+            if t.startswith('$'):
+                if t.startswith('$[') and t.endswith(']'):
+                    model = t[2:-1]
+                elif '=' in t:
+                    k, v = t[1:].split('=', 1)
+                    params[k] = v
+                else:
+                    break  # unrecognized $token: treat rest of line as comment
+            else:
+                clean.append(t)
+        return clean, params, model
+
     def _parse_rcl_element(self, tokens, elem_type):
         """
         Parse R/C/L element handling 2 or 3 terminal devices.
@@ -186,6 +213,10 @@ class SpiceParser(BaseParser):
         if self._is_numeric_value(token3):
             # Classic: R N1 N2 value
             return tokens[1:3], token3, None, 4
+
+        if self._is_parameter(token3):
+            # R N1 N2 key=value ... - params only (model may come from $[...])
+            return tokens[1:3], "0", None, 3
 
         # token3 is not numeric - could be model or third node
         if token4 and not self._is_parameter(token4):
@@ -326,6 +357,11 @@ class SpiceParser(BaseParser):
         self.circuit.add_model(model)
 
     def _parse_component(self, name: str, tokens: List[str], line_num: int):
+        # Separate CDL comment-coded parameters ($SUB=..., $[model], ...)
+        tokens, cdl_params, cdl_model = self._extract_cdl_tokens(tokens)
+        if not tokens:
+            return
+
         # Basic SPICE first letter detection
         first_char = name[0].upper()
         
@@ -439,6 +475,9 @@ class SpiceParser(BaseParser):
              
         # Parse remaining tokens as parameters
         if comp:
+            if cdl_model and not comp.model:
+                comp.model = cdl_model
+            comp.parameters.update(cdl_params)
             if val_idx != -1:
                 remaining = tokens[val_idx:]
                 for piece in remaining:

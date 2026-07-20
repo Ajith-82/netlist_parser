@@ -14,21 +14,15 @@ def remove_comments(line: str) -> str:
     if line.startswith('*'):
         return ""
     
-    # Inline comments with $
+    # Inline comments with $:
+    # A bare '$' (followed by whitespace or end of line) starts a comment.
+    # CDL comment-coded parameters like '$SUB=VSS', '$[model]', '$W=1u' are
+    # significant and must be preserved for the parser to interpret.
     if '$' in line:
-        # Check if it's a parameter like $W=... (CDL specific)
-        # But wait, user says "everything after $ is NOT ignored" for params?
-        # User: "Dollar sign ($) can be used to define comment-coded parameters... everything following... is NOT ignored."
-        # User: "Note that if comment coded parameters are specified after comment '$ text' then they will be ignored."
-        # This implies we should NOT blindly strip $.
-        # However, for Parsing connectivity (netlist parser), we usually ignore params anyway?
-        # Our parser extracts params but doesn't strictly use them for connectivity.
-        # SAFE BET: Strip $ for now to get the structure right, unless $W= affects parsing?
-        # If we have `M1 ... $W=...`, stripping it yields `M1 ...`. Still valid connectivity.
-        # If we have `XX / name $PINS ...`, stripping yields `XX / name`. Valid.
-        # So stripping $ is safer for structure than keeping it and confusing the tokenizer.
-        return line.split('$', 1)[0]
-        
+        m = re.search(r'\$(?=\s|$)', line)
+        if m:
+            return line[:m.start()].rstrip()
+
     return line
 
 def clean_line(line: str) -> str:
