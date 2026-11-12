@@ -10,9 +10,13 @@ def remove_comments(line: str) -> str:
     if not line:
         return ""
         
-    # Full line comments
+    # Full line comments. The CDL control line '*.GLOBAL' is significant:
+    # hand it to the parser as '.GLOBAL'.
     if line.startswith('*'):
-        return ""
+        if line[:8].upper() == '*.GLOBAL' and (len(line) == 8 or line[8].isspace()):
+            line = line[1:]
+        else:
+            return ""
     
     # Inline comments with $:
     # A bare '$' (followed by whitespace or end of line) starts a comment.
@@ -38,5 +42,8 @@ def tokenize_line(line: str) -> list[str]:
     # 1. Sequences starting with non-space/non-quote, optionally containing quoted sections.
     #    This handles: word, key=val, key='v a l'
     # 2. Standalone quoted strings: 'v a l'
+    # 'w = 1u' and 'w= 1u' are the same as 'w=1u'
+    if '=' in line:
+        line = re.sub(r"\s*=\s*", "=", line)
     pattern = r"[^\s']+(?:'[^']*'[^\s']*)*|'[^']*'"
     return re.findall(pattern, line)

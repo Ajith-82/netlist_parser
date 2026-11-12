@@ -8,7 +8,7 @@ from ..ast import (
     Circuit, Subckt, Resistor, Capacitor, Inductor, Mosfet, Bjt, Diode,
     VoltageSource, CurrentSource, SubcktInstance, Model, Component, Parameter
 )
-from ..utils import remove_comments, clean_line
+from ..utils import remove_comments, clean_line, tokenize_line
 
 logger = logging.getLogger(__name__)
 
@@ -78,10 +78,18 @@ class SpiceParser(BaseParser):
 
         logger.info(f"Starting parse of '{filename}'")
 
+        # A SPICE deck starts with a title line. Blank it (keeping line
+        # numbers intact) so prose is not parsed as a device.
+        first, sep, rest = content.partition('\n')
+        if self._looks_like_title(first):
+            logger.info(f"Ignoring title line: {first.strip()}")
+            content = sep + rest
+
         # Pre-load include files in parallel for faster I/O
         if self.num_threads > 1:
             self._preload_includes(content, filename)
         self._process_content(content, filename)
+        self._file_cache = {}  # Release pre-loaded file contents
 
         logger.info(f"Parse complete: {len(self.circuit.subcircuits)} subcircuits, "
                    f"{len(self.circuit.components)} top-level components, "
@@ -89,17 +97,56 @@ class SpiceParser(BaseParser):
 
         return self.circuit
 
-    def _process_content(self, content: str, file_path: str):
+    # Minimum token count for a line to be a plausible device statement
+    _MIN_DEVICE_TOKENS = {'R': 4, 'C': 4, 'L': 4, 'M': 6, 'Q': 5, 'D': 4,
+                          'X': 3, 'V': 4, 'I': 4}
+
+    def _looks_like_title(self, line: str) -> bool:
+        """
+        Decide whether the first line of the top file is a SPICE title.
+
+        CDL netlists and snippets often have no title, so the first line is
+        kept when it is a comment, a dot command, or a plausible device
+        statement. Anything else is treated as a title.
+        """
+        stripped = line.strip()
+        if not stripped or stripped[0] in '.*+$':
+            return False
+        tokens = tokenize_line(remove_comments(stripped))
+        if not tokens:
+            return False
+        min_tokens = self._MIN_DEVICE_TOKENS.get(tokens[0][0].upper())
+        return min_tokens is None or len(tokens) < min_tokens
+
+    def _process_content(self, content: str, file_path: str,
+                         lib_section: Optional[str] = None) -> bool:
+        """
+        Parse content. If lib_section is given, only the lines between
+        '.LIB <lib_section>' and the matching '.ENDL' are parsed.
+        Returns False if a requested section was not found.
+        """
         tokenizer = SpiceTokenizer(content)
-        
+        in_section = lib_section is None
+        found = in_section
+
         for line_num, line in tokenizer.get_logical_lines():
+            if lib_section is not None:
+                head = line.split()
+                cmd = head[0].upper()
+                if not in_section:
+                    if (cmd == '.LIB' and len(head) == 2 and
+                            head[1].strip('"\'').lower() == lib_section):
+                        in_section = found = True
+                    continue
+                if cmd == '.ENDL':
+                    break
             try:
                 self._parse_line(line, line_num, file_path)
             except Exception as e:
                 print(f"Warning: Failed to parse line {line_num} in {file_path}: {line}. Error: {e}")
+        return found
 
     def _parse_line(self, line: str, line_num: int, file_path: str):
-        from ..utils import tokenize_line
         tokens = tokenize_line(line)
         if not tokens:
             return
@@ -112,19 +159,34 @@ class SpiceParser(BaseParser):
             self._parse_component(tokens[0], tokens, line_num)
 
     def _parse_dot_command(self, cmd: str, tokens: List[str], line_num: int, file_path: str):
-        if cmd == '.SUBCKT':
-            self._start_subckt(tokens)
-        elif cmd == '.ENDS':
+        if cmd == '.SUBCKT' or cmd == '.MACRO':
+            self._start_subckt(tokens, line_num, file_path)
+        elif cmd == '.ENDS' or cmd == '.EOM':
             self._end_subckt()
+        elif cmd == '.GLOBAL':
+            self._parse_global(tokens)
         elif cmd == '.MODEL':
             self._parse_model(tokens)
-        elif cmd == '.INCLUDE' or cmd == '.LIB':
+        elif cmd == '.INCLUDE':
             if len(tokens) > 1:
-                include_path = tokens[1]
-                # For .LIB, typically .lib "path" entry_name. We just include the whole file for now.
-                # Remove quotes if present
-                include_path = include_path.strip('"').strip("'")
+                include_path = tokens[1].strip('"').strip("'")
                 self._handle_include(include_path, file_path)
+        elif cmd == '.LIB':
+            if len(tokens) > 2:
+                # .LIB 'file' section: include only that section of the file
+                include_path = tokens[1].strip('"').strip("'")
+                section = tokens[2].strip('"').strip("'").lower()
+                self._handle_include(include_path, file_path, section)
+            elif len(tokens) == 2:
+                # .LIB name: either a whole-file include, or the start of a
+                # section definition (closed by .ENDL), which needs no action.
+                include_path = tokens[1].strip('"').strip("'")
+                target = self._resolve_include_path(include_path, file_path)
+                if os.path.isfile(target):
+                    self._handle_include(include_path, file_path)
+                else:
+                    logger.debug(f"Library section '{include_path}' "
+                                 f"in {file_path}")
         elif cmd == '.PARAM':
             self._parse_param(tokens)
         else:
@@ -219,8 +281,15 @@ class SpiceParser(BaseParser):
             return tokens[1:3], "0", None, 3
 
         # token3 is not numeric - could be model or third node
+        if token4 and self._is_numeric_value(token4):
+            # R N1 N2 model value
+            return tokens[1:3], token4, token3, 5
         if token4 and not self._is_parameter(token4):
             # token4 exists and is not a param -> 3 nodes, token4 is model
+            token5 = tokens[5] if len(tokens) > 5 else None
+            if token5 and self._is_numeric_value(token5):
+                # R N1 N2 N3 model value
+                return tokens[1:4], token5, token4, 6
             return tokens[1:4], "0", token4, 5
         else:
             # 2 nodes, token3 is model
@@ -232,14 +301,14 @@ class SpiceParser(BaseParser):
         This speeds up I/O for netlists with many include files.
         """
         include_pattern = re.compile(
-            r'^\s*\.(INCLUDE|LIB)\s+["\']?([^"\']+)["\']?',
+            r'^\s*\.(?:INCLUDE|LIB)\s+(?:"([^"\n]+)"|\'([^\'\n]+)\'|(\S+))',
             re.IGNORECASE | re.MULTILINE
         )
 
         # Find all includes in the content
         paths_to_load = []
         for match in include_pattern.finditer(content):
-            inc_path = match.group(2).strip()
+            inc_path = next(g for g in match.groups() if g).strip()
             resolved = self._resolve_include_path(inc_path, base_path)
             if resolved not in self._file_cache and os.path.exists(resolved):
                 paths_to_load.append(resolved)
@@ -264,12 +333,15 @@ class SpiceParser(BaseParser):
                     # Recursively pre-load includes from this file
                     self._preload_includes(file_content, path)
 
-    def _handle_include(self, include_path: str, current_file_path: str):
+    def _handle_include(self, include_path: str, current_file_path: str,
+                        lib_section: Optional[str] = None):
         # Resolve path
         target_path = self._resolve_include_path(include_path, current_file_path)
 
-        if target_path in self.visited_files:
-            logger.debug(f"Skipping already visited include: {target_path}")
+        # A library file may be read once per section, so track the pair
+        visit_key = (target_path, lib_section) if lib_section else target_path
+        if visit_key in self.visited_files:
+            logger.debug(f"Skipping already visited include: {visit_key}")
             return  # Cycle or duplicate include detected
 
         if not os.path.exists(target_path):
@@ -277,8 +349,9 @@ class SpiceParser(BaseParser):
             self.circuit.failed_includes.append(target_path)
             return
 
-        self.visited_files.add(target_path)
-        logger.info(f"Processing include: {target_path}")
+        self.visited_files.add(visit_key)
+        logger.info(f"Processing include: {target_path}"
+                    + (f" (section '{lib_section}')" if lib_section else ""))
 
         # Check cache first (populated by _preload_includes)
         if target_path in self._file_cache:
@@ -290,8 +363,27 @@ class SpiceParser(BaseParser):
             return
 
         # Process the content
-        self._process_content(content, target_path)
-        self.circuit.includes.append(target_path)
+        found = self._process_content(content, target_path, lib_section)
+        if not found:
+            logger.warning(f"Library section '{lib_section}' not found in "
+                           f"{target_path}")
+            self.circuit.failed_includes.append(
+                f"{target_path} (section '{lib_section}')")
+            return
+        if target_path not in self.circuit.includes:
+            self.circuit.includes.append(target_path)
+
+    def _parse_global(self, tokens: List[str]):
+        """
+        .GLOBAL / *.GLOBAL name... - names may be comma-separated and carry
+        a CDL pad type suffix (:P power, :G ground).
+        """
+        for token in tokens[1:]:
+            for name in token.split(','):
+                if name[-2:].upper() in (':P', ':G'):
+                    name = name[:-2]
+                if name and name not in self.circuit.globals:
+                    self.circuit.globals.append(name)
 
     def _parse_param(self, tokens: List[str]):
         # tokens[0] is .PARAM
@@ -308,7 +400,8 @@ class SpiceParser(BaseParser):
                 if hasattr(self.current_scope, 'parameters'):
                     self.current_scope.parameters[k] = v
 
-    def _start_subckt(self, tokens: List[str]):
+    def _start_subckt(self, tokens: List[str], line_num: Optional[int] = None,
+                      file_path: Optional[str] = None):
         if len(tokens) < 2:
             raise ValueError("Invalid .SUBCKT definition")
         name = tokens[1]
@@ -325,7 +418,8 @@ class SpiceParser(BaseParser):
             else:
                 cleaned_ports.append(t)
 
-        subckt = Subckt(name=name, ports=cleaned_ports, parameters=params)
+        subckt = Subckt(name=name, ports=cleaned_ports, parameters=params,
+                        source_line=line_num, source_file=file_path)
         self.circuit.add_subckt(subckt)
         logger.debug(f"Found subcircuit: {name} with {len(cleaned_ports)} ports")
 
@@ -341,18 +435,23 @@ class SpiceParser(BaseParser):
         if len(tokens) < 3:
             return 
         name = tokens[1]
-        mtype = tokens[2]
-        # Parse rest as params
+        # '.model name type (k=v ...)': the parameter list may be wrapped in
+        # parentheses, with or without a space after the type.
+        match = re.match(r"([^\s(]+)\s*(.*)", ' '.join(tokens[2:]))
+        mtype = match.group(1)
+        body = match.group(2).strip()
+        if body.startswith('('):
+            body = body[1:]
+            if body.count(')') > body.count('('):
+                body = body[:body.rindex(')')] + body[body.rindex(')') + 1:]
         params = {}
-        for t in tokens[3:]:
+        for t in tokenize_line(body):
             if '=' in t:
                 k, v = t.split('=', 1)
-                # Helper to strip parens if present
-                v = v.strip('()')
+                if v.startswith('(') and v.endswith(')'):
+                    v = v[1:-1]
                 params[k] = v
-            # Handling models with parens like valid( level=1 ) is complex 
-            # This is a basic implementation
-        
+
         model = Model(name=name, model_type=mtype, parameters=params)
         self.circuit.add_model(model)
 
@@ -404,15 +503,19 @@ class SpiceParser(BaseParser):
             val_idx = 6
 
         elif first_char == 'Q':
-            # Qname C B E [S] Model
-            # BJT usually 3 or 4 nodes
-            # Heuristic: check if token 4 is a model or node
-            # Ideally need to know if 4th token is model name. 
-            # For now assume 3 nodes default.
-            nodes = tokens[1:4]
-            model_name = tokens[4]
+            # Qname C B E [S] Model [area] [params]
+            # With a substrate node there are two names after C B E before
+            # any numeric area or key=value parameter.
+            n_nodes = 3
+            if (len(tokens) > 5
+                    and not self._is_parameter(tokens[5])
+                    and not self._is_numeric_value(tokens[5])
+                    and tokens[5].upper() != 'OFF'):
+                n_nodes = 4
+            nodes = tokens[1:1 + n_nodes]
+            model_name = tokens[1 + n_nodes]
             comp = Bjt(name=name, nodes=nodes, model=model_name)
-            val_idx = 5
+            val_idx = 2 + n_nodes
 
         elif first_char == 'D':
             # Dname N+ N- Model
@@ -472,6 +575,12 @@ class SpiceParser(BaseParser):
              value = tokens[3] if len(tokens) > 3 else "0"
              comp = CurrentSource(name=name, nodes=nodes, dc_value=value)
              val_idx = 4
+
+        else:
+            # Unsupported element type (E, F, G, H, K, J, ...)
+            skipped = self.circuit.skipped_elements
+            skipped[first_char] = skipped.get(first_char, 0) + 1
+            logger.debug(f"Skipping unsupported element at line {line_num}: {name}")
              
         # Parse remaining tokens as parameters
         if comp:
@@ -486,7 +595,7 @@ class SpiceParser(BaseParser):
                         comp.parameters[k] = v
                     else:
                         # Handle standalone flags or unparsed params
-                        if 'params' not in comp.parameters:
+                        if 'extra' not in comp.parameters:
                             comp.parameters['extra'] = []
                         if isinstance(comp.parameters.get('extra'), list):
                              comp.parameters['extra'].append(piece)

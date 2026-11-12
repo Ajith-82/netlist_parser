@@ -69,12 +69,13 @@ python3 main.py [file] [options]
 | `--list-models` | List all unique device models in the netlist, hierarchy-wide (fast, no flattening required). Includes CDL-style X-instance leaf devices. |
 | `--find-model <NAME>` | Find and list all subcircuits that directly instantiate the specified model. |
 | `--list-top-cells` | List all potential top-level subcircuits (defined but not instantiated by others). |
+| `--check-duplicates` | Report subcircuit names defined more than once (case-insensitive unless `--case-sensitive`), with the file and line of each definition, labelled identical or conflicting. The last definition is the one used. A short warning is also shown automatically with `--stats`, `--count-transistors`, `--model-usage`, `--flatten` and `--tree`. |
 | `--top-cell <NAME>` | Manually specify the name of the top-level subcircuit to analyze. |
 | `--tree` | Print the hierarchy tree (subcircuit instances only). |
 | `-v, --verbose` | Enable verbose output (INFO level logging). |
 | `--debug` | Enable debug logging (DEBUG level). |
 | `-j, --threads <N>` | Number of threads for parallel I/O (0=auto, 1=disabled). |
-| `--case-sensitive` | Use case-sensitive model names (default: case-insensitive). |
+| `--case-sensitive` | Use case-sensitive model and subcircuit names (default: case-insensitive, as in SPICE). |
 
 ## Examples
 
@@ -134,6 +135,12 @@ python3 main.py examples/complex_soc.cdl --list-top-cells
         and `$KEY=value` (e.g. `$SUB=VSS`, `$W=1u`) becomes a parameter.
         Any other `$token` is treated as the start of a comment.
 -   **Include Files**: Processes `.INCLUDE` and `.LIB` directives with parallel file loading.
+-   **Library Sections**: `.LIB 'file' section` reads only that section (between `.LIB section` and `.ENDL`) of the file. `.LIB 'file'` with no section reads the whole file.
+-   **Global Nets**: `.GLOBAL` and CDL `*.GLOBAL` (including `:P`/`:G` suffixes) are recorded; flattening keeps these nets unscoped unless a subcircuit port of the same name overrides them.
+-   **Macros**: `.MACRO`/`.EOM` are accepted as synonyms for `.SUBCKT`/`.ENDS`.
+-   **Unsupported Elements**: Device lines of other element types (E, F, G, H, K, J, ...) are skipped and reported as a count per type.
+-   **Title Line**: The first line of the top file is ignored as a SPICE title unless it is a comment, a dot command, or a plausible device statement.
+-   **Recursive Subcircuits**: A subcircuit that instantiates itself, directly or indirectly, is reported and the repeated instance is treated as a black box.
 -   **Missing Definitions**: If a subcircuit is instantiated but not defined, it is treated as a black box and reported as a warning.
 
 ## Deployment on HPC Clusters (Slurm)

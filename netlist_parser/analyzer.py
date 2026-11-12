@@ -1,4 +1,5 @@
 from typing import Dict, List, Counter, Optional
+from dataclasses import dataclass, fields
 import copy
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,26 +11,78 @@ logger = logging.getLogger(__name__)
 # Default number of worker threads (can be overridden)
 DEFAULT_WORKERS = min(8, (os.cpu_count() or 4))
 
+# Fields that describe where a node came from, not what it is
+_LOCATION_FIELDS = {"source_line", "source_file", "comments"}
+
+
+@dataclass
+class DuplicateSubckt:
+    """A subcircuit name that is defined more than once."""
+    name: str
+    definitions: List[Subckt]  # In parse order; the last one is the one used
+    identical: bool            # True if all definitions have the same content
+
+
+def _component_signature(comp: Component) -> tuple:
+    """Content of a component, ignoring where it was defined."""
+    return (type(comp).__name__,) + tuple(
+        repr(getattr(comp, f.name)) for f in fields(comp)
+        if f.name not in _LOCATION_FIELDS
+    )
+
+
+def _subckt_signature(subckt: Subckt) -> tuple:
+    """Content of a subcircuit definition, ignoring where it was defined."""
+    return (
+        tuple(subckt.ports),
+        tuple(sorted((k, repr(v)) for k, v in subckt.parameters.items())),
+        tuple(_component_signature(c) for c in subckt.components),
+    )
+
+
 class NetlistAnalyzer:
-    def __init__(self, circuit: Circuit, top_cell_name: Optional[str] = None):
+    def __init__(self, circuit: Circuit, top_cell_name: Optional[str] = None,
+                 case_sensitive: bool = False):
+        """
+        Args:
+            circuit: Parsed circuit.
+            top_cell_name: Optional name of the top-level subcircuit.
+            case_sensitive: If False (default), subcircuit names are matched
+                            case-insensitively, as SPICE does.
+        """
         self.circuit = circuit
         self.top_cell_name = top_cell_name
+        self.case_sensitive = case_sensitive
         self.unresolved_subckts: set[str] = set()
-        # Name -> definition lookup; avoids O(n) scans per instance
-        self._subckt_map: Dict[str, Subckt] = {s.name: s for s in circuit.subcircuits}
+        # Name -> definition lookup; avoids O(n) scans per instance.
+        # If a name is defined more than once, the last definition wins.
+        self._subckt_map: Dict[str, Subckt] = {
+            self._key(s.name): s for s in circuit.subcircuits}
+        # Global nets (.GLOBAL): lookup key -> name as declared
+        self._globals: Dict[str, str] = {}
+        for g in circuit.globals:
+            self._globals.setdefault(self._key(g), g)
 
         logger.info(f"Initializing analyzer for circuit: {circuit.name}")
         if self.top_cell_name:
             logger.info(f"Using specified top cell: {self.top_cell_name}")
             # Validate existence immediately
-            if self.top_cell_name not in self._subckt_map:
+            if self._find_subckt(self.top_cell_name) is None:
                  raise ValueError(f"Top cell '{self.top_cell_name}' not found in netlist.")
+
+    def _key(self, name: str) -> str:
+        """Lookup key for a subcircuit name."""
+        return name if self.case_sensitive else name.lower()
+
+    def _find_subckt(self, name: str) -> Optional[Subckt]:
+        """Returns the definition used for a subcircuit name, if any."""
+        return self._subckt_map.get(self._key(name))
 
     def _get_root_components(self) -> List[Component]:
         """Determines the starting components based on top_cell_name or auto-detection."""
         if self.top_cell_name:
             # User specified top cell
-            subckt = self._subckt_map.get(self.top_cell_name)
+            subckt = self._find_subckt(self.top_cell_name)
             if not subckt:
                 raise ValueError(f"Top cell '{self.top_cell_name}' not found in netlist.")
             logger.debug(f"Using user-specified top cell: {self.top_cell_name} "
@@ -60,7 +113,7 @@ class NetlistAnalyzer:
             return type(comp).__name__
             
         # It's a SubcktInstance. Check if it's a leaf/blackbox.
-        subckt_def = self._subckt_map.get(comp.subckt_name)
+        subckt_def = self._find_subckt(comp.subckt_name)
         
         # If definition found and has components, it's a structural block, not a primitive.
         if subckt_def and subckt_def.components:
@@ -108,8 +161,8 @@ class NetlistAnalyzer:
         try:
             flat_circuit = self.flatten()
             comps = flat_circuit.components
-        except Exception:
-            # Fallback or empty if flattening fails
+        except ValueError:
+            # Top cell not found
             return {}
 
         for comp in comps:
@@ -122,9 +175,10 @@ class NetlistAnalyzer:
         root_name = self.top_cell_name if self.top_cell_name else self.circuit.name
         print(root_name)
 
-        subckt_map = self._subckt_map
+        root_path = ({self._key(self.top_cell_name)} if self.top_cell_name
+                     else set())
 
-        def _print_level(components, prefix=""):
+        def _print_level(components, prefix, on_path):
             # Filter for SubcktInstances only to keep tree readable
             instances = [c for c in components if isinstance(c, SubcktInstance)]
             # Sort by name for consistent output
@@ -133,28 +187,100 @@ class NetlistAnalyzer:
             for i, inst in enumerate(instances):
                 is_last = (i == len(instances) - 1)
                 connector = "└── " if is_last else "├── "
-                print(f"{prefix}{connector}{inst.name} ({inst.subckt_name})")
+                key = self._key(inst.subckt_name)
+                recursive = key in on_path
+                print(f"{prefix}{connector}{inst.name} ({inst.subckt_name})"
+                      + (" [recursive]" if recursive else ""))
 
                 new_prefix = prefix + ("    " if is_last else "│   ")
-                
-                if inst.subckt_name in subckt_map:
-                    _print_level(subckt_map[inst.subckt_name].components, new_prefix)
-                # Else: it's an unresolved subckt or primitive (if we were printing them), nothing to recurse
 
-        _print_level(roots)
+                subckt_def = self._subckt_map.get(key)
+                if subckt_def and not recursive:
+                    on_path.add(key)
+                    _print_level(subckt_def.components, new_prefix, on_path)
+                    on_path.discard(key)
+                # Else: unresolved or recursive subckt, nothing to recurse
+
+        _print_level(roots, "", root_path)
 
     def get_top_cells(self) -> List[str]:
         """Returns a list of names of all top-level subcircuits (defined but not instantiated)."""
-        defined_subckts = {s.name for s in self.circuit.subcircuits}
         instantiated_subckts = set()
-        
+
         for s in self.circuit.subcircuits:
             for comp in s.components:
                 if isinstance(comp, SubcktInstance):
-                    instantiated_subckts.add(comp.subckt_name)
-                    
-        roots = defined_subckts - instantiated_subckts
-        return sorted(list(roots))
+                    instantiated_subckts.add(self._key(comp.subckt_name))
+
+        roots = [s.name for key, s in self._subckt_map.items()
+                 if key not in instantiated_subckts]
+        return sorted(roots)
+
+    def find_recursive_subckts(self) -> List[str]:
+        """
+        Returns the names of subcircuits that instantiate themselves, directly
+        or through other subcircuits. Such netlists are invalid; flatten()
+        treats the repeated instance as a leaf instead of recursing forever.
+        """
+        # Iterative depth-first search; a subcircuit reached again while it
+        # is still on the current path closes a cycle.
+        done: set = set()
+        recursive: set = set()
+        for start in self._subckt_map:
+            if start in done:
+                continue
+            path = [start]
+            on_path = {start}
+            stack = [self._child_keys(start)]
+            while stack:
+                child = next(stack[-1], None)
+                if child is None:
+                    stack.pop()
+                    finished = path.pop()
+                    on_path.discard(finished)
+                    done.add(finished)
+                elif child in on_path:
+                    recursive.update(path[path.index(child):])
+                elif child not in done:
+                    path.append(child)
+                    on_path.add(child)
+                    stack.append(self._child_keys(child))
+        return sorted(self._subckt_map[k].name for k in recursive)
+
+    def _child_keys(self, key: str):
+        """Iterator over the keys of defined subcircuits instantiated in a subcircuit."""
+        seen = set()
+        for comp in self._subckt_map[key].components:
+            if isinstance(comp, SubcktInstance):
+                child = self._key(comp.subckt_name)
+                if child in self._subckt_map and child not in seen:
+                    seen.add(child)
+                    yield child
+
+    def get_duplicate_subckts(self) -> List[DuplicateSubckt]:
+        """
+        Returns subcircuit names that are defined more than once, sorted by name.
+
+        Names are compared the same way instances are resolved:
+        case-insensitively unless the analyzer is case-sensitive. When a name
+        is duplicated, the last definition is the one used by the rest of the
+        analyzer. The reported name is the one written in the first definition.
+        """
+        by_name: Dict[str, List[Subckt]] = {}
+        for subckt in self.circuit.subcircuits:
+            by_name.setdefault(self._key(subckt.name), []).append(subckt)
+
+        duplicates = []
+        for definitions in sorted(by_name.values(), key=lambda d: d[0].name):
+            if len(definitions) < 2:
+                continue
+            name = definitions[0].name
+            first = _subckt_signature(definitions[0])
+            identical = all(_subckt_signature(d) == first
+                            for d in definitions[1:])
+            duplicates.append(DuplicateSubckt(name=name, definitions=definitions,
+                                              identical=identical))
+        return duplicates
 
     def find_top_cell(self) -> Optional[Subckt]:
         """Heuristic to find the top-level subcircuit if the main circuit is empty."""
@@ -166,7 +292,7 @@ class NetlistAnalyzer:
         if len(roots) == 1:
             root_name = roots[0]
             logger.info(f"Single top cell found: {root_name}")
-            return next(s for s in self.circuit.subcircuits if s.name == root_name)
+            return self._find_subckt(root_name)
 
         # Multiple roots - pick the one with the most components (hierarchical complexity)
         # This helps avoid picking small primitives from standard cell libraries
@@ -177,10 +303,11 @@ class NetlistAnalyzer:
 
         def count_components(subckt_name: str, visited: set) -> int:
             """Recursively count components in a subcircuit hierarchy."""
-            if subckt_name in visited or subckt_name not in subckt_map:
+            key = self._key(subckt_name)
+            if key in visited or key not in subckt_map:
                 return 0
-            visited.add(subckt_name)
-            subckt = subckt_map[subckt_name]
+            visited.add(key)
+            subckt = subckt_map[key]
             count = len(subckt.components)
             for comp in subckt.components:
                 if isinstance(comp, SubcktInstance):
@@ -218,7 +345,7 @@ class NetlistAnalyzer:
 
         if best_root:
             logger.info(f"Auto-selected top cell: {best_root} ({best_count} components)")
-            return subckt_map[best_root]
+            return self._find_subckt(best_root)
 
         return None
 
@@ -231,6 +358,10 @@ class NetlistAnalyzer:
         flat_circuit = Circuit(name=self.circuit.name + "_flat")
         flat_circuit.models = list(self.circuit.models)
         subckt_map = self._subckt_map
+        global_nets = self._globals
+        net_key = self._key
+        on_path: set = set()   # Subcircuits being expanded on the current path
+        recursive: set = set()
 
         def _resolve_node(n: str, path: str, node_map: Dict[str, str]) -> str:
             """Map a subckt-local net name to its flattened name."""
@@ -240,6 +371,10 @@ class NetlistAnalyzer:
                 return n  # Top-level net, keep as is
             if n == "0" or n.upper() == "GND":
                 return "0"  # Global GND
+            if global_nets:
+                declared = global_nets.get(net_key(n))
+                if declared is not None:
+                    return declared  # Declared with .GLOBAL
             return f"{path}.{n}"  # Internal net, scope by instance path
 
         # Recursively flatten. node_map maps the current subckt's port names
@@ -249,8 +384,12 @@ class NetlistAnalyzer:
                               node_map: Dict[str, str]):
             for comp in components:
                 if isinstance(comp, SubcktInstance):
-                    subckt_def = subckt_map.get(comp.subckt_name)
-                    if subckt_def and subckt_def.components:
+                    key = self._key(comp.subckt_name)
+                    subckt_def = subckt_map.get(key)
+                    if key in on_path:
+                        # Recursive definition: emit as a leaf below
+                        recursive.add(subckt_def.name)
+                    elif subckt_def and subckt_def.components:
                         # Structural block: recurse with a fresh port map
                         if len(subckt_def.ports) != len(comp.nodes):
                             logger.debug(f"Port count mismatch for {comp.name} "
@@ -260,10 +399,12 @@ class NetlistAnalyzer:
                             port: _resolve_node(node, path, node_map)
                             for port, node in zip(subckt_def.ports, comp.nodes)
                         }
+                        on_path.add(key)
                         _flatten_instance(subckt_def.components, instance_path,
                                           child_map)
+                        on_path.discard(key)
                         continue
-                    if not subckt_def:
+                    elif not subckt_def:
                         # Not found: treat as black box
                         self.unresolved_subckts.add(comp.subckt_name)
                         logger.debug(f"Unresolved subcircuit: {comp.subckt_name}")
@@ -284,7 +425,12 @@ class NetlistAnalyzer:
              # For now let's raise so main() can handle it
              raise e
 
+        if self.top_cell_name:
+            on_path.add(self._key(self.top_cell_name))
         _flatten_instance(start_components, "", {})
+        if recursive:
+            logger.warning("Recursive subcircuits (not expanded further): "
+                           f"{', '.join(sorted(recursive))}")
 
         logger.info(f"Flattening complete: {len(flat_circuit.components)} components")
         if self.unresolved_subckts:
@@ -325,6 +471,21 @@ class NetlistAnalyzer:
 
         return dict(model_counts)
 
+    def _component_model(self, comp: Component,
+                         case_insensitive: bool = True) -> Optional[str]:
+        """Model name of a component if it has one, else None."""
+        if hasattr(comp, 'model') and comp.model:
+            return comp.model.lower() if case_insensitive else comp.model
+        if isinstance(comp, SubcktInstance):
+            # CDL primitives are often X-instances of leaf cells
+            # (e.g. "XM1 d g s b pmos_1p5 W=... L=..."). Treat instances
+            # of empty or undefined subcircuits as devices.
+            sub_def = self._find_subckt(comp.subckt_name)
+            if sub_def is None or not sub_def.components:
+                return (comp.subckt_name.lower() if case_insensitive
+                        else comp.subckt_name)
+        return None
+
     def get_all_models(self, case_insensitive: bool = True) -> List[str]:
         """
         Extract all unique model names from the netlist without flattening.
@@ -341,21 +502,9 @@ class NetlistAnalyzer:
             Sorted list of unique model names found in the netlist.
         """
         models = set()
-        subckt_map = {s.name: s for s in self.circuit.subcircuits}
 
         def extract_model(comp):
-            """Extract model name from a component if it has one."""
-            if hasattr(comp, 'model') and comp.model:
-                return comp.model.lower() if case_insensitive else comp.model
-            if isinstance(comp, SubcktInstance):
-                # CDL primitives are often X-instances of leaf cells
-                # (e.g. "XM1 d g s b pmos_1p5 W=... L=..."). Treat instances
-                # of empty or undefined subcircuits as devices.
-                sub_def = subckt_map.get(comp.subckt_name)
-                if sub_def is None or not sub_def.components:
-                    return (comp.subckt_name.lower() if case_insensitive
-                            else comp.subckt_name)
-            return None
+            return self._component_model(comp, case_insensitive)
 
         # Scan all subcircuit definitions
         for subckt in self.circuit.subcircuits:
@@ -375,6 +524,8 @@ class NetlistAnalyzer:
     def get_subckts_using_model(self, model_name: str, case_insensitive: bool = True) -> List[str]:
         """
         Returns a list of subcircuit names that directly instantiate the given model.
+        Like get_all_models(), this counts X-instances of empty or undefined
+        subcircuits as devices.
 
         Args:
             model_name: The model name to search for.
@@ -386,18 +537,14 @@ class NetlistAnalyzer:
         # Check in all subcircuit definitions
         for subckt in self.circuit.subcircuits:
             for comp in subckt.components:
-                if hasattr(comp, 'model') and comp.model:
-                    comp_model = comp.model.lower() if case_insensitive else comp.model
-                    if comp_model == search_name:
-                        using_subckts.add(subckt.name)
-                        break  # Found usage in this subckt, move to next
+                if self._component_model(comp, case_insensitive) == search_name:
+                    using_subckts.add(subckt.name)
+                    break  # Found usage in this subckt, move to next
 
         # Also check top level if not empty
         for comp in self.circuit.components:
-            if hasattr(comp, 'model') and comp.model:
-                comp_model = comp.model.lower() if case_insensitive else comp.model
-                if comp_model == search_name:
-                    using_subckts.add(self.circuit.name)
-                    break
+            if self._component_model(comp, case_insensitive) == search_name:
+                using_subckts.add(self.circuit.name)
+                break
 
         return sorted(list(using_subckts))

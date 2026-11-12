@@ -100,6 +100,10 @@ class Circuit(AstNode):
     models: List[Model] = field(default_factory=list)
     includes: List[str] = field(default_factory=list)
     failed_includes: List[str] = field(default_factory=list)
+    # Global net names from .GLOBAL / *.GLOBAL
+    globals: List[str] = field(default_factory=list)
+    # Device lines of unsupported element types: first letter -> count
+    skipped_elements: Dict[str, int] = field(default_factory=dict)
     parameters: Dict[str, Union[str, float, Expression]] = field(default_factory=dict)
     
     def add_component(self, component: Component):

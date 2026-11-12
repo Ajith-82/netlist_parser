@@ -9,6 +9,18 @@ from .parser.spice import SpiceParser
 from .analyzer import NetlistAnalyzer
 
 
+def _print_duplicates(duplicates):
+    """Print each duplicated subcircuit name with its definition sites."""
+    for dup in duplicates:
+        status = ("identical" if dup.identical
+                  else "CONFLICTING - last one is used")
+        print(f"{dup.name} ({len(dup.definitions)} definitions, {status})")
+        for d in dup.definitions:
+            written = f" (as '{d.name}')" if d.name != dup.name else ""
+            print(f"  - {d.source_file or '<unknown>'}:{d.source_line or '?'}"
+                  f"{written}")
+
+
 def main():
     """Main entry point for the netlist-parser CLI."""
     parser = argparse.ArgumentParser(
@@ -48,6 +60,10 @@ def main():
         help="List all potential top-level subcircuits (not instantiated)"
     )
     parser.add_argument(
+        "--check-duplicates", action="store_true",
+        help="Report subcircuits that are defined more than once"
+    )
+    parser.add_argument(
         "--top-cell", metavar="TOP_CELL_NAME",
         help="Manually specify the name of the top-level subcircuit"
     )
@@ -65,7 +81,8 @@ def main():
     )
     parser.add_argument(
         "--case-sensitive", action="store_true",
-        help="Use case-sensitive model names (default: case-insensitive)"
+        help="Use case-sensitive model and subcircuit names "
+             "(default: case-insensitive)"
     )
 
     args = parser.parse_args()
@@ -104,8 +121,16 @@ def main():
 
     print(f"Successfully parsed circuit: {circuit.name}")
 
+    if circuit.skipped_elements:
+        total = sum(circuit.skipped_elements.values())
+        detail = ", ".join(f"{letter}: {count}" for letter, count
+                           in sorted(circuit.skipped_elements.items()))
+        print(f"\n[WARNING] {total} device line(s) of unsupported element "
+              f"types were skipped ({detail}).")
+
     try:
-        analyzer = NetlistAnalyzer(circuit, top_cell_name=args.top_cell)
+        analyzer = NetlistAnalyzer(circuit, top_cell_name=args.top_cell,
+                                   case_sensitive=args.case_sensitive)
     except Exception as e:
         print(f"Error initializing analyzer: {e}")
         sys.exit(1)
@@ -147,6 +172,34 @@ def main():
             print(f"  - {fail}")
         print("  (Missing includes explain why subcircuits are undefined "
               "and treated as black boxes.)")
+
+    uses_hierarchy = (args.stats or args.count_transistors or args.model_usage
+                      or args.flatten or args.tree)
+    if uses_hierarchy:
+        recursive = analyzer.find_recursive_subckts()
+        if recursive:
+            print("\n[WARNING] The following subcircuits instantiate "
+                  "themselves, directly or indirectly:")
+            for name in recursive:
+                print(f"  - {name}")
+            print("  (The repeated instance is treated as a black box, so "
+                  "counts are incomplete.)")
+
+    duplicates = analyzer.get_duplicate_subckts()
+    if args.check_duplicates:
+        print("\n--- Duplicate Subcircuits ---")
+        if duplicates:
+            _print_duplicates(duplicates)
+            print(f"\nTotal: {len(duplicates)} duplicated subcircuit "
+                  f"name{'s' if len(duplicates) != 1 else ''}")
+        else:
+            print("No duplicate subcircuits found.")
+    elif duplicates and uses_hierarchy:
+        print("\n[WARNING] The following subcircuits are defined more than "
+              "once:")
+        _print_duplicates(duplicates)
+        print("  (Results use the last definition of each. Run "
+              "--check-duplicates for this report on its own.)")
 
     if args.list_models:
         print("\n--- All Models in Netlist ---")
