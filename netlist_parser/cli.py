@@ -7,6 +7,7 @@ import logging
 
 from .parser.spice import SpiceParser
 from .analyzer import NetlistAnalyzer
+from .dedupe import remove_duplicate_subckts, verify_dedupe
 
 
 def _print_duplicates(duplicates):
@@ -19,6 +20,55 @@ def _print_duplicates(duplicates):
             written = f" (as '{d.name}')" if d.name != dup.name else ""
             print(f"  - {d.source_file or '<unknown>'}:{d.source_line or '?'}"
                   f"{written}")
+
+
+def _where(subckt):
+    return f"{subckt.source_file or '<unknown>'}:{subckt.source_line or '?'}"
+
+
+def _remove_duplicates(args, circuit, analyzer):
+    """Write a copy of the netlist without duplicated subcircuits."""
+    print("\n--- Remove Duplicate Subcircuits ---")
+    try:
+        # newline="" keeps the file's own line endings
+        with open(args.file, 'r', newline="") as f:
+            content = f.read()
+        result = remove_duplicate_subckts(analyzer, args.file, content,
+                                          keep=args.keep)
+        if result.removed:
+            verify_dedupe(circuit, result, args.file,
+                          case_sensitive=args.case_sensitive)
+            with open(args.remove_duplicates, 'x', newline="") as f:
+                f.write(result.text)
+    except (OSError, ValueError) as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+    if result.removed:
+        n = len(result.removed)
+        print(f"Removed {n} duplicate definition{'s' if n != 1 else ''}:")
+        for subckt in sorted(result.removed,
+                             key=lambda s: (s.name, s.source_line or 0)):
+            print(f"  - {subckt.name} ({_where(subckt)})")
+        print(f"Wrote '{args.remove_duplicates}' (verified by re-parsing).")
+        out_dir = os.path.dirname(os.path.abspath(args.remove_duplicates))
+        if (circuit.includes
+                and out_dir != os.path.dirname(os.path.abspath(args.file))):
+            print("  Note: the output is in a different directory, so "
+                  "relative .INCLUDE/.LIB paths may no longer resolve.")
+    else:
+        print("No removable duplicates; nothing written.")
+
+    if result.unresolved:
+        print("\nConflicting duplicates were NOT removed "
+              "(use --keep first|last to choose):")
+        _print_duplicates(result.unresolved)
+
+    if result.in_includes:
+        print("\nRedundant definitions in included files were NOT removed "
+              "(only the main file is rewritten):")
+        for subckt in result.in_includes:
+            print(f"  - {subckt.name} ({_where(subckt)})")
 
 
 def main():
@@ -64,6 +114,17 @@ def main():
         help="Report subcircuits that are defined more than once"
     )
     parser.add_argument(
+        "--remove-duplicates", metavar="OUTPUT",
+        help="Write a copy of the netlist to OUTPUT with duplicated "
+             "subcircuit definitions removed. Identical duplicates are "
+             "removed; conflicting ones only with --keep"
+    )
+    parser.add_argument(
+        "--keep", choices=["first", "last"],
+        help="With --remove-duplicates: also remove conflicting duplicates, "
+             "keeping the first or last definition"
+    )
+    parser.add_argument(
         "--top-cell", metavar="TOP_CELL_NAME",
         help="Manually specify the name of the top-level subcircuit"
     )
@@ -87,6 +148,9 @@ def main():
 
     args = parser.parse_args()
 
+    if args.keep and not args.remove_duplicates:
+        parser.error("--keep requires --remove-duplicates")
+
     # Configure logging
     if args.debug:
         logging.basicConfig(
@@ -104,6 +168,14 @@ def main():
     if not os.path.exists(args.file):
         print(f"Error: File '{args.file}' not found.")
         sys.exit(1)
+
+    if args.remove_duplicates:
+        # Check before the (possibly long) parse
+        if os.path.exists(args.remove_duplicates):
+            same = os.path.samefile(args.remove_duplicates, args.file)
+            print(f"Error: Output file '{args.remove_duplicates}' "
+                  + ("is the input file." if same else "already exists."))
+            sys.exit(1)
 
     # Determine thread count (0=auto, uses CPU count)
     if args.threads == 0:
@@ -200,6 +272,9 @@ def main():
         _print_duplicates(duplicates)
         print("  (Results use the last definition of each. Run "
               "--check-duplicates for this report on its own.)")
+
+    if args.remove_duplicates:
+        _remove_duplicates(args, circuit, analyzer)
 
     if args.list_models:
         print("\n--- All Models in Netlist ---")

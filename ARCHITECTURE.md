@@ -68,6 +68,14 @@ The analyzer performs heavy lifting on the AST.
 *   **Recursion Check (`find_recursive_subckts`)**: Depth-first search over the subcircuit graph that reports definitions lying on an instantiation cycle. `flatten()` and `print_hierarchy()` track the subcircuits on the current path and stop expanding when one repeats.
 *   **Model Extraction (`get_all_models`)**: Scans all subcircuit definitions and top-level components without flattening. Besides modeled primitives (M/Q/D/R/C/L), instances of *empty or undefined* subcircuits are counted as devices — CDL netlists commonly instantiate PDK primitives as X-elements of leaf cells (e.g. `XM1 d g s b pmos_1p5 W=1u L=0.2u`).
 
+### 2.4 Duplicate Removal (`netlist_parser/dedupe.py`)
+
+Backs the `--remove-duplicates OUTPUT` option. It works on the source text rather than re-emitting the AST, so everything outside the removed blocks is preserved byte-for-byte.
+
+*   **`remove_duplicate_subckts`**: Uses `get_duplicate_subckts()` and each definition's recorded source line to cut redundant `.SUBCKT ... .ENDS` blocks (nesting-aware, including `+` continuations) out of the top-level file. Identical duplicates are always reduced to one copy (a copy in an included file is preferred, since included files are never rewritten). Conflicting duplicates are left alone and reported unless `--keep first|last` is given.
+*   **`verify_dedupe`**: Re-parses the cleaned text and checks that the set of subcircuit names and the component counts are consistent with the original before anything is written.
+*   **CLI safety**: The input file is never modified and an existing output file is never overwritten.
+
 ## 3. Key Data Flows
 
 ### 3.1 flattening Algorithm

@@ -70,6 +70,8 @@ python3 main.py [file] [options]
 | `--find-model <NAME>` | Find and list all subcircuits that directly instantiate the specified model. |
 | `--list-top-cells` | List all potential top-level subcircuits (defined but not instantiated by others). |
 | `--check-duplicates` | Report subcircuit names defined more than once (case-insensitive unless `--case-sensitive`), with the file and line of each definition, labelled identical or conflicting. The last definition is the one used. A short warning is also shown automatically with `--stats`, `--count-transistors`, `--model-usage`, `--flatten` and `--tree`. |
+| `--remove-duplicates <OUTPUT>` | Write a copy of the netlist to `OUTPUT` with duplicated subcircuit definitions cut out; the rest of the text is left exactly as it was. Identical duplicates are removed. Conflicting ones are left in place unless `--keep` is given. The input is never modified, an existing `OUTPUT` is never overwritten, and only the main file is rewritten (not included files). |
+| `--keep first\|last` | With `--remove-duplicates`: also remove conflicting duplicates, keeping the first or last definition (`last` is the one the analysis uses). |
 | `--top-cell <NAME>` | Manually specify the name of the top-level subcircuit to analyze. |
 | `--tree` | Print the hierarchy tree (subcircuit instances only). |
 | `-v, --verbose` | Enable verbose output (INFO level logging). |
